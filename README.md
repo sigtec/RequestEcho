@@ -20,7 +20,8 @@ returns a plain-text dump of the request, including:
 dotnet run
 ```
 
-Listens on `http://0.0.0.0:5080` and `https://0.0.0.0:5443` (ASP.NET Core dev certificate,
+Listens on `http://0.0.0.0:5080` and `https://0.0.0.0:5443` (certificate auto-selected from
+LocalMachine\My, see [Server certificate](#server-certificate);
 `ClientCertificateMode=AllowCertificate`, every client certificate is accepted).
 Ports/certificate are configured in `appsettings.json` (`Kestrel:Endpoints`), e.g. a real certificate:
 
@@ -31,6 +32,97 @@ Ports/certificate are configured in `appsettings.json` (`Kestrel:Endpoints`), e.
   "Certificate": { "Path": "echo.pfx", "Password": "..." }
 }
 ```
+
+## Server certificate
+
+The HTTPS certificate is determined in this order (first match wins):
+
+1. `Kestrel:Endpoints:<Name>:Certificate`: certificate for one endpoint (file or store)
+2. `Kestrel:Certificates:Default`: default for all HTTPS endpoints (file or store)
+3. `Echo:ServerCertificate`: automatic selection from the Windows certificate store (see below)
+4. ASP.NET Core development certificate (`dotnet dev-certs https`)
+5. none: the HTTPS endpoints without a certificate are **not started**, only HTTP comes up
+   (`Server certificate: none available - HTTPS endpoint(s) disabled: Https`)
+
+An explicitly configured certificate (1., 2. or `Echo:ServerCertificate:Thumbprint`) is never skipped:
+if it cannot be loaded, startup fails.
+
+### Automatic selection from the certificate store
+
+By default (`Echo:ServerCertificate:AutoSelect=true`) the app looks in **LocalMachine\My**
+("Computer certificates > Personal") at startup and takes the best certificate:
+
+- required: private key that this account can read, currently valid, EKU *Server Authentication*
+  (or no EKU), key usage allows TLS, matches the `Subject` filter (if set)
+- ranking: matches the host name/FQDN (incl. wildcard) > trusted chain > latest expiry
+
+The candidates (`+` usable, `-` rejected with reason) and the chosen certificate are printed at startup.
+If nothing fits, the dev certificate is used, or HTTPS stays off if there is none. Machine keys are often readable only by administrators
+and `SYSTEM`. Run the app elevated or grant the service account read access to the private key
+(certlm.msc > certificate > *All Tasks* > *Manage Private Keys...*).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `Echo:ServerCertificate:AutoSelect` | `true` | enable automatic selection |
+| `Echo:ServerCertificate:Location` | `LocalMachine` | `LocalMachine` or `CurrentUser` |
+| `Echo:ServerCertificate:Store` | `My` | store name (`My`, `WebHosting`, ...) |
+| `Echo:ServerCertificate:Subject` | | only certificates whose subject or DNS name contains this text |
+| `Echo:ServerCertificate:Thumbprint` | | exactly this certificate (SHA-1 thumbprint); startup fails if it is missing or its key is not readable |
+
+### Specifying a certificate via command line or environment variables
+
+Every setting can be overridden on the command line (`--Section:Key=Value`) or via environment
+variables (`Section__Key`, optionally with the `ASPNETCORE_` prefix). Command line wins over environment
+variables, and both win over `appsettings.json`.
+
+Certificate from the store by thumbprint:
+
+```powershell
+RequestEcho.exe --Echo:ServerCertificate:Thumbprint=F5B5BDC4F0912AA4B841A89D5BFECC1B135720E3
+```
+
+```powershell
+$env:Echo__ServerCertificate__Thumbprint = "F5B5BDC4F0912AA4B841A89D5BFECC1B135720E3"
+RequestEcho.exe
+```
+
+Certificate from the store by subject (auto selection limited to matching certificates):
+
+```powershell
+RequestEcho.exe --Echo:ServerCertificate:Subject=echo.example.org
+```
+
+The same via Kestrel's built-in store support (picks the valid matching certificate with the latest expiry):
+
+```powershell
+RequestEcho.exe --Kestrel:Certificates:Default:Subject=echo.example.org --Kestrel:Certificates:Default:Store=My --Kestrel:Certificates:Default:Location=LocalMachine
+```
+
+Certificate from a PFX file:
+
+```powershell
+RequestEcho.exe --Kestrel:Certificates:Default:Path=C:\certs\echo.pfx --Kestrel:Certificates:Default:Password=secret
+```
+
+```powershell
+$env:Kestrel__Certificates__Default__Path = "C:\certs\echo.pfx"
+$env:Kestrel__Certificates__Default__Password = "secret"
+RequestEcho.exe
+```
+
+PEM certificate and key:
+
+```bash
+export Kestrel__Certificates__Default__Path=/etc/ssl/echo.crt
+export Kestrel__Certificates__Default__KeyPath=/etc/ssl/echo.key
+dotnet RequestEcho.dll
+```
+
+Only for the `Https` endpoint: `--Kestrel:Endpoints:Https:Certificate:Path=...` (or `Subject`/`Store`/`Location`).
+To use the dev certificate instead of the store: `--Echo:ServerCertificate:AutoSelect=false`
+(without a dev certificate this starts HTTP only).
+
+## Request handling
 
 Every HTTP method is accepted (also `TRACE`, `CONNECT`, `OPTIONS *`, WebDAV and custom verbs).
 Absolute-form targets (`GET http://other.host/ HTTP/1.1`) are accepted even if the Host header
