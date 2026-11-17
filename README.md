@@ -33,6 +33,8 @@ Ports/certificate are configured in `appsettings.json` (`Kestrel:Endpoints`), e.
 }
 ```
 
+For hosting under IIS see [Running under IIS](#running-under-iis).
+
 ## Server certificate
 
 The HTTPS certificate is determined in this order (first match wins):
@@ -144,6 +146,84 @@ startup lines remain. Instead every connection is logged **byte-exact** to the c
 
 Settings: `Echo:WireLog` (on/off), `Echo:WireLogMaxBytes` (max bytes shown per chunk).
 Only endpoints defined under `Kestrel:Endpoints` are logged (not ones from `ASPNETCORE_URLS`).
+
+## Running under IIS
+
+Under IIS the **IIS site bindings** decide ports, host names and the HTTPS certificate.
+`Kestrel:Endpoints`, `Echo:ServerCertificate` and the certificate fallback described above have
+no effect. How much of the request the echo can still see depends on the hosting model:
+
+| | `inprocess` (default, recommended) | `outofprocess` |
+|---|---|---|
+| Server | IIS itself (no Kestrel) | Kestrel on a random `127.0.0.1` port, IIS forwards |
+| Bindings / TLS | IIS / http.sys | IIS / http.sys (the port is set by the ASP.NET Core Module, `Kestrel:Endpoints` is overridden) |
+| Wire log | **not available** (Kestrel only) | only the plain-text hop IIS -> Kestrel |
+| "direct TCP peer" | real client | rewritten from `X-Forwarded-For` by the IIS integration (original header moves to `X-Original-For`); the real peer is `127.0.0.1` |
+| TLS details (protocol, cipher) | yes | no (only `X-Forwarded-Proto`) |
+| Client certificate | yes | only as header `MS-ASPNETCORE-CLIENTCERT` (not decoded by the echo yet) |
+
+### Setup
+
+1. Install the **.NET 10 Hosting Bundle** on the server, then run `iisreset`.
+2. Create an application pool with *.NET CLR version* = **No Managed Code**.
+3. Publish and point the site to the output folder:
+   ```powershell
+   dotnet publish -c Release -o C:\inetpub\RequestEcho
+   ```
+4. Add the bindings (http/https, host name, certificate) to the site in IIS Manager.
+
+A `web.config` placed in the project folder is taken over (and completed) by `dotnet publish`.
+Suggested content:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <location path="." inheritInChildApplications="false">
+    <system.webServer>
+      <!-- WebDAV would otherwise swallow PUT, DELETE, PROPFIND, ... -->
+      <modules>
+        <remove name="WebDAVModule" />
+      </modules>
+      <handlers>
+        <remove name="WebDAV" />
+        <add name="aspNetCore" path="*" verb="*" modules="AspNetCoreModuleV2" resourceType="Unspecified" />
+      </handlers>
+      <aspNetCore processPath=".\RequestEcho.exe" hostingModel="inprocess"
+                  stdoutLogEnabled="false" stdoutLogFile=".\logs\stdout">
+        <environmentVariables>
+          <!-- the certificate comes from the IIS binding; skip the store search at startup -->
+          <environmentVariable name="Echo__ServerCertificate__AutoSelect" value="false" />
+        </environmentVariables>
+      </aspNetCore>
+      <security>
+        <requestFiltering allowDoubleEscaping="true" allowHighBitCharacters="true">
+          <requestLimits maxAllowedContentLength="104857600" maxUrl="16384" maxQueryString="16384" />
+        </requestFiltering>
+      </security>
+    </system.webServer>
+  </location>
+</configuration>
+```
+
+### Things to keep in mind
+
+- **Console output** (startup messages, `Echo:LogToConsole`) only appears in the stdout log:
+  set `stdoutLogEnabled="true"`, create the `logs` folder and give the app pool identity write access.
+- **Client certificates**: in the site's *SSL Settings* set *Client certificates* to **Accept**
+  (or *Require*). IIS then requests the certificate via TLS renegotiation, which does not work with
+  HTTP/2 or TLS 1.3. To request it during the handshake, enable it on the http.sys binding:
+  `netsh http update sslcert ipport=0.0.0.0:443 ... clientcertnegotiation=enable`
+  (or `hostnameport=<name>:443` for SNI bindings).
+- **Windows authentication**: if enabled in IIS, IIS handles the NTLM/Negotiate handshake itself.
+  Enable only *Anonymous* if the echo should see and decode the raw `Authorization` headers.
+- **Request filtering** blocks some requests before they reach the app, e.g. hidden segments
+  (`/bin`, `/App_Data`, `web.config`), denied verbs, double-escaped URLs, bodies over 30 MB (default)
+  and long URLs. Relax `<requestFiltering>` as needed (see `web.config` above).
+- **http.sys normalizes requests**: absolute-form targets, `OPTIONS *` and malformed requests are
+  handled by http.sys (often answered with 400 without reaching the app). The raw request line is
+  therefore not always exactly what the client sent. Use the self-hosted exe (Kestrel) for byte-exact analysis.
+- **Server certificate selection**: the app pool identity normally cannot read machine private keys,
+  so the store search finds nothing. Disable it via `Echo__ServerCertificate__AutoSelect=false` (see above).
 
 ## Response control (query parameters)
 
